@@ -1187,6 +1187,7 @@ impl From<S3EncryptionHeaders> for HeaderMap {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use crate::gcp::GoogleConfigKey;
 
     #[test]
     fn s3_test_config_from_map() {
