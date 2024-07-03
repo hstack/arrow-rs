@@ -394,7 +394,7 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_sse_bucket_key_enabled" => {
                 Ok(Self::Encryption(S3EncryptionConfigKey::BucketKeyEnabled))
             }
-            _ => match s.parse() {
+            _ => match s.strip_prefix("aws_").unwrap_or(s).parse() {
                 Ok(key) => Ok(Self::Client(key)),
                 Err(_) => Err(Error::UnknownConfigurationKey { key: s.into() }.into()),
             },
@@ -1108,6 +1108,7 @@ impl From<S3EncryptionHeaders> for HeaderMap {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use crate::gcp::GoogleConfigKey;
 
     #[test]
     fn s3_test_config_from_map() {
@@ -1363,6 +1364,16 @@ mod tests {
 
         for (bucket, expected) in cases {
             assert_eq!(parse_bucket_az(bucket), expected)
+        }
+    }
+
+    #[test]
+    fn aws_test_client_opts() {
+        let key = "AWS_PROXY_URL";
+        if let Ok(config_key) = key.to_ascii_lowercase().parse() {
+            assert_eq!(AmazonS3ConfigKey::Client(ClientConfigKey::ProxyUrl), config_key);
+        } else {
+            panic!("{} not propagated as ClientConfigKey", key);
         }
     }
 }
