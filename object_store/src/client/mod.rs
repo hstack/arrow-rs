@@ -52,7 +52,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, ClientBuilder, NoProxy, Proxy, RequestBuilder};
 use serde::{Deserialize, Serialize};
-
+use tracing::debug;
 use crate::config::{fmt_duration, ConfigValue};
 use crate::path::Path;
 use crate::{GetOptions, Result};
@@ -593,16 +593,20 @@ impl ClientOptions {
     }
 
     pub(crate) fn client(&self) -> Result<Client> {
+        debug!("ClientOptions::client() - start");
         let mut builder = ClientBuilder::new();
 
+        debug!("ClientOptions::client() - builder");
         match &self.user_agent {
             Some(user_agent) => builder = builder.user_agent(user_agent.get()?),
             None => builder = builder.user_agent(DEFAULT_USER_AGENT),
         }
+        debug!("ClientOptions::client() - useragent");
 
         if let Some(headers) = &self.default_headers {
             builder = builder.default_headers(headers.clone())
         }
+        debug!("ClientOptions::client() - headers");
 
         if let Some(proxy) = &self.proxy_url {
             let mut proxy = Proxy::all(proxy).map_err(map_client_error)?;
@@ -622,59 +626,74 @@ impl ClientOptions {
 
             builder = builder.proxy(proxy);
         }
+        debug!("ClientOptions::client() - proxy settings");
 
         for certificate in &self.root_certificates {
             builder = builder.add_root_certificate(certificate.0.clone());
         }
+        debug!("ClientOptions::client() - certs");
 
         if let Some(timeout) = &self.timeout {
             builder = builder.timeout(timeout.get()?)
         }
+        debug!("ClientOptions::client() - timeout");
 
         if let Some(timeout) = &self.connect_timeout {
             builder = builder.connect_timeout(timeout.get()?)
         }
+        debug!("ClientOptions::client() - connect_timeout");
 
         if let Some(timeout) = &self.pool_idle_timeout {
             builder = builder.pool_idle_timeout(timeout.get()?)
         }
+        debug!("ClientOptions::client() - idle_timeout");
 
         if let Some(max) = &self.pool_max_idle_per_host {
             builder = builder.pool_max_idle_per_host(max.get()?)
         }
+        debug!("ClientOptions::client() - max_idle");
 
         if let Some(interval) = &self.http2_keep_alive_interval {
             builder = builder.http2_keep_alive_interval(interval.get()?)
         }
+        debug!("ClientOptions::client() - keep_alive_interval");
 
         if let Some(interval) = &self.http2_keep_alive_timeout {
             builder = builder.http2_keep_alive_timeout(interval.get()?)
         }
+        debug!("ClientOptions::client() - keep_alive_timeout");
 
         if self.http2_keep_alive_while_idle.get()? {
             builder = builder.http2_keep_alive_while_idle(true)
         }
+        debug!("ClientOptions::client() - keep_alive_while_idle");
 
         if let Some(sz) = &self.http2_max_frame_size {
             builder = builder.http2_max_frame_size(Some(sz.get()?))
         }
+        debug!("ClientOptions::client() - max_frame_size");
 
         if self.http1_only.get()? {
             builder = builder.http1_only()
         }
+        debug!("ClientOptions::client() - http1_only");
 
         if self.http2_only.get()? {
             builder = builder.http2_prior_knowledge()
         }
+        debug!("ClientOptions::client() - http2_only");
 
         if self.allow_insecure.get()? {
             builder = builder.danger_accept_invalid_certs(true)
         }
+        debug!("ClientOptions::client() - allow_insecure");
 
-        builder
+        let result = builder
             .https_only(!self.allow_http.get()?)
             .build()
-            .map_err(map_client_error)
+            .map_err(map_client_error);
+        debug!("ClientOptions::client() - end");
+        result
     }
 }
 
