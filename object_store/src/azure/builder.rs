@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::debug;
 use url::Url;
 
 /// The well-known account used by Azurite and the legacy Azure Storage Emulator.
@@ -867,6 +868,7 @@ impl MicrosoftAzureBuilder {
 
     /// Configure a connection to container with given name on Microsoft Azure Blob store.
     pub fn build(mut self) -> Result<MicrosoftAzure> {
+        debug!("[TASE-BLD-1] open builder");
         if let Some(url) = self.url.take() {
             self.parse_url(&url)?;
         }
@@ -961,17 +963,21 @@ impl MicrosoftAzureBuilder {
             } else if let (Some(client_id), Some(client_secret), Some(tenant_id)) =
                 (&self.client_id, self.client_secret, &self.tenant_id)
             {
+                debug!("[TASE-BLD-2] cred start");
                 let client_credential = ClientSecretOAuthProvider::new(
                     client_id.clone(),
                     client_secret,
                     tenant_id,
                     self.authority_host,
                 );
-                Arc::new(TokenCredentialProvider::new(
+                debug!("[TASE-BLD-3] ClientSecretOAuthProvider");
+                let aa = Arc::new(TokenCredentialProvider::new(
                     client_credential,
                     self.client_options.client()?,
                     self.retry_config.clone(),
-                )) as _
+                )) as _;
+                debug!("[TASE-BLD-4] TokenCredentialProvider");
+                aa
             } else if let Some(query_pairs) = self.sas_query_pairs {
                 static_creds(AzureCredential::SASToken(query_pairs))
             } else if let Some(sas) = self.sas_key {
@@ -1005,9 +1011,11 @@ impl MicrosoftAzureBuilder {
             service: storage_url,
             credentials: auth,
         };
+        debug!("[TASE-BLD-5] before azure client");
 
         let client = Arc::new(AzureClient::new(config)?);
 
+        debug!("[TASE-BLD-n] build()");
         Ok(MicrosoftAzure { client })
     }
 }
