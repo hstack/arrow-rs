@@ -73,6 +73,8 @@ use num::{NumCast, ToPrimitive};
 pub struct CastOptions<'a> {
     /// how to handle cast failures, either return NULL (safe=true) or return ERR (safe=false)
     pub safe: bool,
+    pub allow_pruning: bool,
+    pub allow_empty_fill: bool,
     /// Formatting options when casting from temporal types to string
     pub format_options: FormatOptions<'a>,
 }
@@ -81,15 +83,83 @@ impl Default for CastOptions<'_> {
     fn default() -> Self {
         Self {
             safe: true,
+            allow_pruning: false,
+            allow_empty_fill: false,
             format_options: FormatOptions::default(),
         }
     }
 }
 
+
+/// Check whether an Arrow [DataType] is recursive in the sense that we need to
+/// look inside and continue unpacking the data
+/// This is used when creating a schema based on a deep projection
+pub fn data_type_has_deep_container(dt: &DataType) -> bool {
+    match dt {
+        // scalars
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Timestamp(_, _)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => false,
+        // containers
+        DataType::Dictionary(_, value_type) => data_type_has_deep_container(value_type.as_ref()),
+        DataType::RunEndEncoded(_, val) => data_type_has_deep_container(val.data_type()),
+        DataType::Union(ufields, _) => {
+            ufields
+                .iter()
+                .any(|(idx, f)| data_type_has_deep_container(f.data_type()))
+        },
+        DataType::List(f) => data_type_has_deep_container(f.data_type()),
+        DataType::ListView(f) => data_type_has_deep_container(f.data_type()),
+        DataType::FixedSizeList(f, _) => data_type_has_deep_container(f.data_type()),
+        DataType::LargeList(f) => data_type_has_deep_container(f.data_type()),
+        DataType::LargeListView(f) => data_type_has_deep_container(f.data_type()),
+        // list of struct
+        DataType::Map(_, _) => true,
+        DataType::Struct(_) => true,
+    }
+}
+
 /// Return true if a value of type `from_type` can be cast into a value of `to_type`.
+/// Use `cast_options` for different casting options
 ///
 /// See [`cast_with_options`] for more information
 pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
+    let cast_options = CastOptions::default();
+    can_cast_types_with_options(from_type, to_type, &cast_options)
+}
+
+/// Return true if a value of type `from_type` can be cast into a value of `to_type`.
+///
+/// See [`cast_with_options`] for more information
+pub fn can_cast_types_with_options(from_type: &DataType, to_type: &DataType, cast_options: &CastOptions) -> bool {
     use self::DataType::*;
     use self::IntervalUnit::*;
     use self::TimeUnit::*;
@@ -134,37 +204,38 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         ) => true,
         // Dictionary/List conditions should be put in front of others
         (Dictionary(_, from_value_type), Dictionary(_, to_value_type)) => {
-            can_cast_types(from_value_type, to_value_type)
+            can_cast_types_with_options(from_value_type, to_value_type, cast_options)
         }
         (Dictionary(_, value_type), _) => can_cast_types(value_type, to_type),
         (_, Dictionary(_, value_type)) => can_cast_types(from_type, value_type),
         (List(list_from) | LargeList(list_from), List(list_to) | LargeList(list_to)) => {
-            can_cast_types(list_from.data_type(), list_to.data_type())
+            can_cast_types_with_options(list_from.data_type(), list_to.data_type(), cast_options)
         }
         (List(list_from) | LargeList(list_from), Utf8 | LargeUtf8) => {
-            can_cast_types(list_from.data_type(), to_type)
+            can_cast_types_with_options(list_from.data_type(), to_type, cast_options)
         }
         (List(list_from) | LargeList(list_from), FixedSizeList(list_to, _)) => {
-            can_cast_types(list_from.data_type(), list_to.data_type())
+            can_cast_types_with_options(list_from.data_type(), list_to.data_type(), cast_options)
         }
         (List(_), _) => false,
         (FixedSizeList(list_from,_), List(list_to)) |
         (FixedSizeList(list_from,_), LargeList(list_to)) => {
-            can_cast_types(list_from.data_type(), list_to.data_type())
+            can_cast_types_with_options(list_from.data_type(), list_to.data_type(), cast_options)
         }
         (FixedSizeList(inner, size), FixedSizeList(inner_to, size_to)) if size == size_to => {
-            can_cast_types(inner.data_type(), inner_to.data_type())
+            can_cast_types_with_options(inner.data_type(), inner_to.data_type(), cast_options)
         }
-        (_, List(list_to)) => can_cast_types(from_type, list_to.data_type()),
-        (_, LargeList(list_to)) => can_cast_types(from_type, list_to.data_type()),
+        (_, List(list_to)) => can_cast_types_with_options(from_type, list_to.data_type(), cast_options),
+        (_, LargeList(list_to)) => can_cast_types_with_options(from_type, list_to.data_type(), cast_options),
         (_, FixedSizeList(list_to,size)) if *size == 1 => {
-            can_cast_types(from_type, list_to.data_type())},
+            can_cast_types_with_options(from_type, list_to.data_type(), cast_options)},
         (FixedSizeList(list_from,size), _) if *size == 1 => {
-            can_cast_types(list_from.data_type(), to_type)},
+            can_cast_types_with_options(list_from.data_type(), to_type, cast_options)},
         (Map(from_entries,ordered_from), Map(to_entries, ordered_to)) if ordered_from == ordered_to =>
             match (key_field(from_entries), key_field(to_entries), value_field(from_entries), value_field(to_entries)) {
                 (Some(from_key), Some(to_key), Some(from_value), Some(to_value)) =>
-                    can_cast_types(from_key.data_type(), to_key.data_type()) && can_cast_types(from_value.data_type(), to_value.data_type()),
+                    can_cast_types_with_options(from_key.data_type(), to_key.data_type(), cast_options) &&
+                        can_cast_types_with_options(from_value.data_type(), to_value.data_type(), cast_options),
                 _ => false
             },
         // cast one decimal type to another decimal type
@@ -187,12 +258,28 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         // string to decimal
         (Utf8View | Utf8 | LargeUtf8, Decimal128(_, _) | Decimal256(_, _)) => true,
         (Struct(from_fields), Struct(to_fields)) => {
-            from_fields.len() == to_fields.len() &&
-                from_fields.iter().zip(to_fields.iter()).all(|(f1, f2)| {
-                    // Assume that nullability between two structs are compatible, if not,
-                    // cast kernel will return error.
-                    can_cast_types(f1.data_type(), f2.data_type())
+            // if we allow pruning, check the destination source fields, to see whether they exist in the source fields
+            if cast_options.allow_pruning {
+                to_fields.iter().enumerate().all(|(idx, to_field)| {
+                    let to_field_name = to_field.name();
+                    if let Some(from_field) = from_fields
+                        .iter()
+                        .find(|from_field| from_field.name() == to_field_name) {
+                        can_cast_types_with_options(to_field.data_type(), from_field.data_type(), cast_options)
+                    } else {
+                        // if we don't have a source field, but we DO have the option to return an empty array
+                        // and the destination field is nullable, that means it's castable
+                        cast_options.allow_empty_fill && to_field.is_nullable()
+                    }
                 })
+            } else {
+                from_fields.len() == to_fields.len() &&
+                    from_fields.iter().zip(to_fields.iter()).all(|(f1, f2)| {
+                        // Assume that nullability between two structs are compatible, if not,
+                        // cast kernel will return error.
+                        can_cast_types_with_options(f1.data_type(), f2.data_type(), cast_options)
+                    })
+            }
         }
         (Struct(_), _) => false,
         (_, Struct(_)) => false,
@@ -934,16 +1021,58 @@ pub fn cast_with_options(
                 cast_options,
             )
         }
-        (Struct(_), Struct(to_fields)) => {
+        (Struct(from_fields), Struct(to_fields)) => {
             let array = array.as_struct();
-            let fields = array
-                .columns()
-                .iter()
-                .zip(to_fields.iter())
-                .map(|(l, field)| cast_with_options(l, field.data_type(), cast_options))
-                .collect::<Result<Vec<ArrayRef>, ArrowError>>()?;
-            let array = StructArray::try_new(to_fields.clone(), fields, array.nulls().cloned())?;
-            Ok(Arc::new(array) as ArrayRef)
+            // array.len()
+            if cast_options.allow_pruning {
+                let dst_fields_result: Result<Vec<(ArrayRef, FieldRef)>, ArrowError> = to_fields.iter().map(|to_field| {
+                    let to_field_name = to_field.name();
+                    // if the field exists in the source
+                    if let Some(from_field_with_idx) = from_fields
+                        .iter()
+                        .enumerate()
+                        .find(|(from_field_idx, from_field)| from_field.name() == to_field_name) {
+                        let (from_idx, _) = from_field_with_idx;
+                        let from_array = array.column(from_idx).clone();
+                        let to_array = cast_with_options(from_array.as_ref(), to_field.data_type(), cast_options)?;
+
+                        Ok((to_array, to_field.clone()))
+                    } else {
+                        // if the field doesn't exist, can we empty fill ?
+                        if cast_options.allow_empty_fill {
+                            if to_field.is_nullable() {
+                                let tmp_array = new_null_array(to_field.data_type(), array.len());
+                                Ok((tmp_array, to_field.clone()))
+                            } else {
+                                Err(ArrowError::CastError(format!(
+                                    "Destination field `{to_field_name}` is not nullable"
+                                )))
+                            }
+                        } else {
+                            Err(ArrowError::CastError(format!(
+                                "Field `{to_field_name}` not found in source arrays"
+                            )))
+                        }
+                    }
+                }).collect();
+                let dst_arrays_and_fields:(Vec<_>, Vec<_>) = dst_fields_result?
+                    .into_iter().unzip();
+                let array = StructArray::try_new(
+                    Fields::from(dst_arrays_and_fields.1),
+                    dst_arrays_and_fields.0,
+                    array.nulls().cloned()
+                )?;
+                Ok(Arc::new(array) as ArrayRef)
+            } else {
+                let fields = array
+                    .columns()
+                    .iter()
+                    .zip(to_fields.iter())
+                    .map(|(l, field)| cast_with_options(l, field.data_type(), cast_options))
+                    .collect::<Result<Vec<ArrayRef>, ArrowError>>()?;
+                let array = StructArray::try_new(to_fields.clone(), fields, array.nulls().cloned())?;
+                Ok(Arc::new(array) as ArrayRef)
+            }
         }
         (Struct(_), _) => Err(ArrowError::CastError(format!(
             "Casting from {from_type:?} to {to_type:?} not supported"
@@ -2474,7 +2603,9 @@ mod tests {
 
             let cast_option = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_empty_fill: false,
+                allow_pruning: false,
+                ..Default::default()
             };
             let result = cast_with_options($INPUT_ARRAY, $OUTPUT_TYPE, &cast_option).unwrap();
             assert_eq!($OUTPUT_TYPE, result.data_type());
@@ -2750,7 +2881,9 @@ mod tests {
             &output_type,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert_eq!("Cast error: Cannot cast to Decimal128(38, 38). Overflowing on 170141183460469231731687303715884105727",
@@ -2770,7 +2903,9 @@ mod tests {
             &output_type,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert_eq!("Cast error: Cannot cast to Decimal256(76, 76). Overflowing on 170141183460469231731687303715884105727",
@@ -2809,7 +2944,9 @@ mod tests {
             &output_type,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert_eq!("Cast error: Cannot cast to Decimal128(38, 7). Overflowing on 170141183460469231731687303715884105727",
@@ -2828,7 +2965,9 @@ mod tests {
             &output_type,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert_eq!("Cast error: Cannot cast to Decimal256(76, 55). Overflowing on 170141183460469231731687303715884105727",
@@ -2988,7 +3127,9 @@ mod tests {
             &DataType::UInt8,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -3001,7 +3142,9 @@ mod tests {
             &DataType::UInt8,
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -3015,7 +3158,9 @@ mod tests {
             &DataType::Int8,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -3028,7 +3173,9 @@ mod tests {
             &DataType::Int8,
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -3191,7 +3338,7 @@ mod tests {
             &DataType::Int8,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -3204,7 +3351,9 @@ mod tests {
             &DataType::Int8,
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -3621,7 +3770,9 @@ mod tests {
         // overflow with the error
         let cast_option = CastOptions {
             safe: false,
-            format_options: FormatOptions::default(),
+            allow_pruning: false,
+            allow_empty_fill: false,
+            ..Default::default()
         };
         let result = cast_with_options(&array, &DataType::UInt8, &cast_option);
         assert!(result.is_err());
@@ -3833,7 +3984,9 @@ mod tests {
             &DataType::Int32,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         match result {
@@ -3872,7 +4025,9 @@ mod tests {
             &DataType::Boolean,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         );
         match casted {
@@ -4215,7 +4370,9 @@ mod tests {
 
         let options = CastOptions {
             safe: true,
-            format_options: FormatOptions::default(),
+            allow_pruning: false,
+            allow_empty_fill: false,
+            ..Default::default()
         };
         let res = cast_with_options(&str, &DataType::Int16, &options).expect("should cast to i16");
         let expected =
@@ -4288,7 +4445,9 @@ mod tests {
 
                 let options = CastOptions {
                     safe: false,
-                    format_options: FormatOptions::default(),
+                    allow_pruning: false,
+                    allow_empty_fill: false,
+                    ..Default::default()
                 };
                 let err = cast_with_options(array, &to_type, &options).unwrap_err();
                 assert_eq!(
@@ -4334,7 +4493,9 @@ mod tests {
 
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             };
             let err = cast_with_options(array, &to_type, &options).unwrap_err();
             assert_eq!(
@@ -4357,7 +4518,7 @@ mod tests {
         let to_type = DataType::Date32;
         let options = CastOptions {
             safe: false,
-            format_options: FormatOptions::default(),
+            ..Default::default()
         };
         let b = cast_with_options(&array, &to_type, &options).unwrap();
         let c = b.as_primitive::<Date32Type>();
@@ -4377,7 +4538,7 @@ mod tests {
         let to_type = DataType::Date32;
         let options = CastOptions {
             safe: false,
-            format_options: FormatOptions::default(),
+            ..Default::default()
         };
         let err = cast_with_options(&array, &to_type, &options).unwrap_err();
         assert_eq!(
@@ -4405,7 +4566,7 @@ mod tests {
             let to_type = DataType::Date32;
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             };
             let result = cast_with_options(&array, &to_type, &options).unwrap();
             let c = result.as_primitive::<Date32Type>();
@@ -4455,7 +4616,7 @@ mod tests {
 
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             };
             let err = cast_with_options(array, &to_type, &options).unwrap_err();
             assert_eq!(err.to_string(), "Cast error: Cannot cast string '08:08:61.091323414' to value of Time32(Second) type");
@@ -4497,7 +4658,9 @@ mod tests {
 
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             };
             let err = cast_with_options(array, &to_type, &options).unwrap_err();
             assert_eq!(err.to_string(), "Cast error: Cannot cast string '08:08:61.091323414' to value of Time32(Millisecond) type");
@@ -4531,7 +4694,9 @@ mod tests {
 
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             };
             let err = cast_with_options(array, &to_type, &options).unwrap_err();
             assert_eq!(err.to_string(), "Cast error: Cannot cast string 'Not a valid time' to value of Time64(Microsecond) type");
@@ -4565,7 +4730,7 @@ mod tests {
 
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             };
             let err = cast_with_options(array, &to_type, &options).unwrap_err();
             assert_eq!(err.to_string(), "Cast error: Cannot cast string 'Not a valid time' to value of Time64(Nanosecond) type");
@@ -4599,7 +4764,9 @@ mod tests {
 
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             };
             let err = cast_with_options(array, &to_type, &options).unwrap_err();
             assert_eq!(
@@ -4615,7 +4782,7 @@ mod tests {
 
             let options = CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             };
 
             let target_interval_array = cast_with_options(
@@ -4742,7 +4909,7 @@ mod tests {
             let string_array = Arc::new(StringArray::from($data_vec.clone())) as ArrayRef;
             let options = CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             };
             let arrow_err = cast_with_options(
                 &string_array.clone(),
@@ -4851,7 +5018,7 @@ mod tests {
             &DataType::FixedSizeBinary(5),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(array_ref.is_err());
@@ -4861,7 +5028,7 @@ mod tests {
             &DataType::FixedSizeBinary(5),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(array_ref.is_err());
@@ -5066,7 +5233,7 @@ mod tests {
         let array = TimestampSecondArray::from(vec![Some(i64::MAX)]);
         let options = CastOptions {
             safe: false,
-            format_options: FormatOptions::default(),
+            ..Default::default()
         };
         let b = cast_with_options(&array, &DataType::Date64, &options);
         assert!(b.is_err());
@@ -5612,6 +5779,8 @@ mod tests {
         let tz = "+0545"; // UTC + 0545 is Asia/Kathmandu
         let cast_options = CastOptions {
             safe: true,
+            allow_pruning: false,
+            allow_empty_fill: false,
             format_options: FormatOptions::default()
                 .with_timestamp_format(Some(ts_format))
                 .with_timestamp_tz_format(Some(ts_format)),
@@ -8234,6 +8403,32 @@ mod tests {
     }
 
     #[test]
+    fn test_can_cast_struct_to_struct_with_pruning() {
+        let from_type = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Boolean, false),
+                Field::new("b", DataType::Int32, false),
+            ]
+                .into(),
+        );
+        let to_type = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Boolean, false),
+            ].into(),
+        );
+        // normal casting shouldn't work
+        assert_eq!(can_cast_types(&from_type, &to_type), false);
+        let mut cast_options = CastOptions::default();
+        cast_options.allow_pruning = true;
+        assert_eq!(can_cast_types_with_options(&from_type, &to_type, &cast_options), true);
+        // now, reverse the order, the cast should fail, because we don't allow empty fill
+        assert_eq!(can_cast_types_with_options(&to_type, &from_type, &cast_options), false);
+        // and now, the cast should succeed, because we do allow empty fill
+        cast_options.allow_empty_fill = true;
+        assert_eq!(can_cast_types_with_options(&to_type, &from_type, &cast_options), true);
+    }
+
+    #[test]
     fn test_cast_map_field_names() {
         let string_builder = StringBuilder::new();
         let value_builder = StringBuilder::new();
@@ -8511,7 +8706,7 @@ mod tests {
             &DataType::Decimal128(38, 30),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -8522,7 +8717,7 @@ mod tests {
             &DataType::Decimal128(38, 30),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_err());
@@ -8537,7 +8732,7 @@ mod tests {
             &DataType::Decimal256(76, 76),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -8548,7 +8743,7 @@ mod tests {
             &DataType::Decimal256(76, 76),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_err());
@@ -8563,7 +8758,7 @@ mod tests {
             &DataType::Decimal128(2, 2),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -8574,7 +8769,7 @@ mod tests {
             &DataType::Decimal128(2, 2),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         let err = casted_array.unwrap_err().to_string();
@@ -8594,7 +8789,7 @@ mod tests {
             &DataType::Decimal256(2, 2),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -8605,7 +8800,7 @@ mod tests {
             &DataType::Decimal256(2, 2),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         let err = casted_array.unwrap_err().to_string();
@@ -8625,7 +8820,7 @@ mod tests {
             &DataType::Decimal128(38, 30),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -8636,7 +8831,7 @@ mod tests {
             &DataType::Decimal128(38, 30),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         let err = casted_array.unwrap_err().to_string();
@@ -8656,7 +8851,7 @@ mod tests {
             &DataType::Decimal256(76, 50),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -8667,7 +8862,7 @@ mod tests {
             &DataType::Decimal256(76, 50),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         let err = casted_array.unwrap_err().to_string();
@@ -9162,7 +9357,7 @@ mod tests {
         let array = Arc::new(str_array) as ArrayRef;
         let option = CastOptions {
             safe: false,
-            format_options: FormatOptions::default(),
+            ..Default::default()
         };
         let casted_err = cast_with_options(&array, &output_type, &option).unwrap_err();
         assert!(casted_err
@@ -9204,7 +9399,7 @@ mod tests {
             &DataType::Decimal128(10, 8),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -9215,7 +9410,7 @@ mod tests {
             &DataType::Decimal128(10, 8),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert_eq!("Invalid argument error: 100000000000 is too large to store in a Decimal128 of precision 10. Max is 9999999999", err.unwrap_err().to_string());
@@ -9287,7 +9482,7 @@ mod tests {
             &DataType::Decimal256(10, 8),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -9298,7 +9493,7 @@ mod tests {
             &DataType::Decimal256(10, 8),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert_eq!("Invalid argument error: 100000000000 is too large to store in a Decimal256 of precision 10. Max is 9999999999", err.unwrap_err().to_string());
@@ -9344,7 +9539,7 @@ mod tests {
 
         let cast_options = CastOptions {
             safe: false,
-            format_options: FormatOptions::default(),
+            ..Default::default()
         };
 
         let result = cast_string_to_timestamp::<i32, TimestampNanosecondType>(
@@ -9472,7 +9667,7 @@ mod tests {
                 &DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.clone())),
                 &CastOptions {
                     safe: false,
-                    format_options: FormatOptions::default(),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -9523,7 +9718,7 @@ mod tests {
         let s = BinaryArray::from(vec![v1, v2]);
         let options = CastOptions {
             safe: true,
-            format_options: FormatOptions::default(),
+            ..Default::default()
         };
         let array = cast_with_options(&s, &DataType::Utf8, &options).unwrap();
         let a = array.as_string::<i32>();
@@ -9655,7 +9850,7 @@ mod tests {
             &DataType::Decimal128(7, 3),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -9666,7 +9861,7 @@ mod tests {
             &DataType::Decimal128(7, 3),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert_eq!("Invalid argument error: 1234567000 is too large to store in a Decimal128 of precision 7. Max is 9999999", err.unwrap_err().to_string());
@@ -9681,7 +9876,7 @@ mod tests {
             &DataType::Decimal256(7, 3),
             &CastOptions {
                 safe: true,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_ok());
@@ -9692,7 +9887,7 @@ mod tests {
             &DataType::Decimal256(7, 3),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert_eq!("Invalid argument error: 1234567000 is too large to store in a Decimal256 of precision 7. Max is 9999999", err.unwrap_err().to_string());
@@ -9739,7 +9934,7 @@ mod tests {
             array,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_err());
@@ -9772,7 +9967,7 @@ mod tests {
             array,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_err());
@@ -9805,7 +10000,7 @@ mod tests {
             array,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         );
         assert!(casted_array.is_err());
@@ -9831,7 +10026,7 @@ mod tests {
             array,
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -9861,7 +10056,7 @@ mod tests {
         let nullable = CastOptions::default();
         let fallible = CastOptions {
             safe: false,
-            format_options: FormatOptions::default(),
+            ..Default::default()
         };
         let v = IntervalMonthDayNano::new(0, 0, 1234567);
 
@@ -10028,7 +10223,9 @@ mod tests {
             &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
             &CastOptions {
                 safe: false,
-                format_options: FormatOptions::default(),
+                allow_pruning: false,
+                allow_empty_fill: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -10089,6 +10286,8 @@ mod tests {
 
     const CAST_OPTIONS: CastOptions<'static> = CastOptions {
         safe: true,
+        allow_pruning: false,
+        allow_empty_fill: false,
         format_options: FormatOptions::new(),
     };
 
@@ -10102,6 +10301,8 @@ mod tests {
     fn test_list_format_options() {
         let options = CastOptions {
             safe: false,
+            allow_pruning: false,
+            allow_empty_fill: false,
             format_options: FormatOptions::default().with_null("null"),
         };
         let array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
@@ -10197,6 +10398,137 @@ mod tests {
         let result = cast(&struct_array, &to_type);
         assert_eq!(
             "Cast error: Casting from Boolean to Date32 not supported",
+            result.unwrap_err().to_string()
+        );
+    }
+
+    #[test]
+    fn test_cast_struct_to_struct_with_pruning() {
+        let from_type = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Boolean, false),
+                Field::new("b", DataType::Int32, false),
+            ]
+                .into(),
+        );
+        let to_type = DataType::Struct(
+            vec![
+                Field::new("b", DataType::Int32, false),
+            ]
+                .into(),
+        );
+        let boolean = Arc::new(BooleanArray::from(vec![false, false, true, true]));
+        let int = Arc::new(Int32Array::from(vec![42, 28, 19, 31]));
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Boolean, false)),
+                boolean.clone() as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Int32, false)),
+                int.clone() as ArrayRef,
+            ),
+        ]);
+        let casted_array = cast_with_options(&struct_array, &to_type, &CastOptions {
+            safe: false,
+            allow_pruning: true,
+            allow_empty_fill: false,
+            format_options: Default::default(),
+        }).unwrap();
+        let casted_array = casted_array.as_struct();
+        println!("casted: {:?}", &casted_array);
+        assert_eq!(casted_array.data_type(), &to_type);
+        let casted_int_array = casted_array
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        println!("{:?}", casted_int_array);
+        assert_eq!(casted_int_array, vec![42, 28, 19, 31]);
+
+        // test for can't cast
+        let to_type = DataType::Struct(
+            vec![
+                Field::new("c", DataType::Date32, false),
+            ]
+                .into(),
+        );
+        assert!(!can_cast_types(&from_type, &to_type));
+        let result = cast_with_options(&struct_array, &to_type, &CastOptions {
+            safe: false,
+            allow_pruning: true,
+            allow_empty_fill: false,
+            format_options: Default::default(),
+        });
+        assert_eq!(
+            "Cast error: Field `c` not found in source arrays",
+            result.unwrap_err().to_string()
+        );
+    }
+
+    #[test]
+    fn test_cast_struct_to_struct_with_allow_empty() {
+        let from_type = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Boolean, false),
+                Field::new("b", DataType::Int32, false),
+            ]
+                .into(),
+        );
+        let to_type = DataType::Struct(
+            vec![
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int32, true),
+            ].into(),
+        );
+        let boolean = Arc::new(BooleanArray::from(vec![false, false, true, true]));
+        let int = Arc::new(Int32Array::from(vec![42, 28, 19, 31]));
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Boolean, false)),
+                boolean.clone() as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Int32, false)),
+                int.clone() as ArrayRef,
+            ),
+        ]);
+        let casted_array = cast_with_options(&struct_array, &to_type, &CastOptions {
+            safe: false,
+            allow_pruning: true,
+            allow_empty_fill: true,
+            format_options: Default::default(),
+        }).unwrap();
+        let casted_array = casted_array.as_struct();
+        println!("casted: {:?}", &casted_array);
+        assert_eq!(casted_array.data_type(), &to_type);
+        let casted_int_array = casted_array
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let casted_missing_int_array = array_to_strings(casted_array.column(1));
+        assert_eq!(casted_int_array, vec![42, 28, 19, 31]);
+        assert_eq!(casted_missing_int_array, vec!["null".to_string(), "null".to_string(), "null".to_string(), "null".to_string()]);
+
+        // test for can't cast, when destination is not nullable
+        let to_type = DataType::Struct(
+            vec![
+                Field::new("c", DataType::Date32, false),
+            ]
+                .into(),
+        );
+        assert!(!can_cast_types(&from_type, &to_type));
+        let result = cast_with_options(&struct_array, &to_type, &CastOptions {
+            safe: false,
+            allow_pruning: true,
+            allow_empty_fill: true,
+            format_options: Default::default(),
+        });
+        assert_eq!(
+            "Cast error: Destination field `c` is not nullable",
             result.unwrap_err().to_string()
         );
     }
